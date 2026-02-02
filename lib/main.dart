@@ -103,7 +103,6 @@ class _MainShellState extends State<MainShell> {
     super.dispose();
   }
 
-  // NEW: Logic to change the Linux Wallpaper via KDE command
   Future<void> _applyRandomWallpaper() async {
     try {
       final dir = Directory('/usr/share/backgrounds');
@@ -124,7 +123,7 @@ class _MainShellState extends State<MainShell> {
   }
 
   void _switchView() {
-    _applyRandomWallpaper(); // Apply wallpaper when moving to Info Screen
+    _applyRandomWallpaper();
     setState(() {
       _showInfoScreen = true;
     });
@@ -205,22 +204,71 @@ class _WelcomeViewState extends State<WelcomeView> {
           mainAxisAlignment: MainAxisAlignment.center,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            FadeInLeft(duration: const Duration(milliseconds: 800), child: Container(width: 60, height: 6, color: AppTheme.primaryBlue)),
+            // Fixed container for the line to prevent layout shift during FadeIn
+            SizedBox(
+              width: 60,
+              height: 6,
+              child: FadeInLeft(
+                from: 50, // Explicit distance to ensure consistent start point
+                duration: const Duration(milliseconds: 800),
+                child: Container(color: AppTheme.primaryBlue)
+              ),
+            ),
             const SizedBox(height: 30),
             SizedBox(
               height: 120,
+              // FIX START: Added alignment to AnimatedSwitcher
               child: AnimatedSwitcher(
                 duration: const Duration(milliseconds: 600),
-                transitionBuilder: (Widget child, Animation<double> animation) {
-                  return FadeTransition(opacity: animation, child: SlideTransition(position: Tween<Offset>(begin: const Offset(0.0, 0.1), end: Offset.zero).animate(animation), child: child));
+                // This layoutBuilder forces all children to align left in the stack,
+                // preventing the "center-to-left" jump when text width changes.
+                layoutBuilder: (Widget? currentChild, List<Widget> previousChildren) {
+                  return Stack(
+                    alignment: Alignment.centerLeft,
+                    children: <Widget>[
+                      ...previousChildren,
+                      if (currentChild != null) currentChild,
+                    ],
+                  );
                 },
-                child: Text(_greetings[_index], key: ValueKey<int>(_index), style: GoogleFonts.montserrat(fontSize: 90, fontWeight: FontWeight.w200, color: AppTheme.darkText, height: 1.0, letterSpacing: -2)),
+                transitionBuilder: (Widget child, Animation<double> animation) {
+                  return FadeTransition(
+                    opacity: animation,
+                    child: SlideTransition(
+                      position: Tween<Offset>(
+                        begin: const Offset(0.0, 0.1),
+                        end: Offset.zero
+                      ).animate(animation),
+                      child: child
+                    )
+                  );
+                },
+                child: Text(
+                  _greetings[_index],
+                  key: ValueKey<int>(_index),
+                  style: GoogleFonts.montserrat(
+                    fontSize: 90,
+                    fontWeight: FontWeight.w200,
+                    color: AppTheme.darkText,
+                    height: 1.0,
+                    letterSpacing: -2
+                  )
+                ),
               ),
+              // FIX END
             ),
             const SizedBox(height: 10),
-            FadeInUp(delay: const Duration(milliseconds: 500), child: Text("Welcome to Blue Archive Linux", style: GoogleFonts.rubik(fontSize: 28, color: AppTheme.primaryBlue, fontWeight: FontWeight.w700, letterSpacing: 1.5))),
+            FadeInUp(
+              delay: const Duration(milliseconds: 500),
+              child: Text("Welcome to Blue Archive Linux",
+                          style: GoogleFonts.rubik(fontSize: 28, color: AppTheme.primaryBlue, fontWeight: FontWeight.w700, letterSpacing: 1.5)
+              )
+            ),
             const SizedBox(height: 60),
-            FadeInUp(delay: const Duration(milliseconds: 800), child: SenseiButton(text: "CONNECT TO SCHALE", onPressed: widget.onNext)),
+            FadeInUp(
+              delay: const Duration(milliseconds: 800),
+              child: SenseiButton(text: "CONNECT TO SCHALE", onPressed: widget.onNext)
+            ),
           ],
         ),
       ),
