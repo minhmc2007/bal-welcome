@@ -11,6 +11,82 @@ import 'package:animate_do/animate_do.dart';
 import 'package:window_manager/window_manager.dart';
 
 // ==========================================
+// SYSTEM & ONE-TIME RUN LOGIC
+// ==========================================
+
+enum SystemMode { liveIso, installed, unknown }
+
+/// Checks if we are in the Arch ISO Live Environment
+bool _isLiveEnv() {
+  return Directory('/run/archiso/bootmnt').existsSync();
+}
+
+/// Checks if the system is fully installed (system-wide marker)
+bool _isInstalled() {
+  return File('/etc/bal-installed').existsSync();
+}
+
+/// Determines current system state
+SystemMode getSystemMode() {
+  if (_isInstalled()) return SystemMode.installed;
+  if (_isLiveEnv()) return SystemMode.liveIso;
+  return SystemMode.unknown;
+}
+
+/// 1. Checks for Session Lock (Prevent opening app twice in same session)
+/// 2. Checks for First-Run Lock (If installed, prevent running ever again)
+Future<void> performStartupChecks() async {
+  final mode = getSystemMode();
+  final String? home = Platform.environment['HOME'];
+
+  // A. SESSION LOCK (Prevents double-clicking icon)
+  // ------------------------------------------------
+  final sessionLock = File('/tmp/bal_welcome_session.lock');
+  if (await sessionLock.exists()) {
+    // App is already running in this session. Exit silently.
+    exit(0);
+  }
+  try {
+    await sessionLock.create();
+    // Clean up lock when app closes naturally (optional, but good practice)
+    ProcessSignal.sigterm.watch().listen((_) => sessionLock.deleteSync());
+  } catch (e) {
+    debugPrint("Warning: Could not create session lock: $e");
+  }
+
+  // B. PERSISTENT LOCK (Strict "Run Once" for Installed System)
+  // ------------------------------------------------
+  // If we are installed, we only want to run this app ONE TIME ever.
+  if (mode == SystemMode.installed && home != null) {
+    final firstRunMarker = File('$home/.config/bal-welcome-done');
+
+    if (await firstRunMarker.exists()) {
+      debugPrint("System is installed and Welcome App has run before.");
+      debugPrint("Exiting to prevent re-run.");
+      exit(0);
+    }
+  }
+}
+
+/// Creates the persistent marker so the app doesn't run again on next boot
+Future<void> markSetupAsComplete() async {
+  final String? home = Platform.environment['HOME'];
+  if (home != null) {
+    try {
+      final configDir = Directory('$home/.config');
+      if (!await configDir.exists()) {
+        await configDir.create(recursive: true);
+      }
+      // Create the empty file acting as a flag
+      await File('$home/.config/bal-welcome-done').create();
+      debugPrint("Setup marked as complete. App will not open again.");
+    } catch (e) {
+      debugPrint("Failed to mark setup complete: $e");
+    }
+  }
+}
+
+// ==========================================
 // LINUX LOCALE FIX
 // ==========================================
 void fixLinuxLocale() {
@@ -29,7 +105,10 @@ void fixLinuxLocale() {
 }
 
 Future<void> main() async {
+  // Run checks BEFORE UI init. If check fails (already run), app exits here.
+  await performStartupChecks();
   fixLinuxLocale();
+
   WidgetsFlutterBinding.ensureInitialized();
   MediaKit.ensureInitialized();
   await windowManager.ensureInitialized();
@@ -56,6 +135,7 @@ class AppTheme {
   static const Color cyanAccent = Color(0xFF00E5FF);
   static const Color darkText = Color(0xFF2D3436);
   static const Color warningRed = Color(0xFFFF4757);
+  static const Color successGreen = Color(0xFF00B894);
 }
 
 class BlueArchiveLinuxApp extends StatelessWidget {
@@ -86,13 +166,15 @@ class _MainShellState extends State<MainShell> {
   late final Player _player;
   late final VideoController _controller;
 
-  // State management for view transitions
   bool _isLoading = false;
   bool _showInfoScreen = false;
+  late SystemMode _currentMode;
 
   @override
   void initState() {
     super.initState();
+    _currentMode = getSystemMode();
+
     _player = Player();
     _controller = VideoController(_player);
     _player.open(Media('asset:///assets/video/bg_loop.mp4'));
@@ -106,14 +188,9 @@ class _MainShellState extends State<MainShell> {
     super.dispose();
   }
 
-  /// 1. Picks random wallpaper
-  /// 2. Applies it visually via plasma (optional, for immediate feedback)
-  /// 3. Copies to ~/wallpaper/img.png
-  /// 4. Runs main.sh
+  /// Theme generation logic (Main.sh)
   Future<void> _processThemeAndWallpaper() async {
-    setState(() {
-      _isLoading = true;
-    });
+    setState(() => _isLoading = true);
 
     try {
       final dir = Directory('/usr/share/backgrounds');
@@ -127,50 +204,26 @@ class _MainShellState extends State<MainShell> {
           final randomFile = files[Random().nextInt(files.length)];
           final String selectedPath = randomFile.path;
 
-          debugPrint("Selected Wallpaper: $selectedPath");
+          // Apply visually immediately (optional)
+          try { await Process.run('plasma-apply-wallpaperimage', [selectedPath]); } catch (_) {}
 
-          // Optional: Immediate visual change using KDE tool if available
-          // We do this inside a try-catch so it doesn't crash if command missing
-          try {
-            await Process.run('plasma-apply-wallpaperimage', [selectedPath]);
-          } catch (_) {}
-
-          // Get Home Directory
           final String? home = Platform.environment['HOME'];
           if (home != null) {
             final targetDir = Directory('$home/wallpaper');
-            if (!await targetDir.exists()) {
-              await targetDir.create(recursive: true);
-            }
+            if (!await targetDir.exists()) await targetDir.create(recursive: true);
 
-            // Copy file to ~/wallpaper/img.png
+            // Copy to ~/wallpaper/img.png
             final File sourceFile = File(selectedPath);
-            final String targetPath = '$home/wallpaper/img.png';
-            await sourceFile.copy(targetPath);
-            debugPrint("Copied to: $targetPath");
+            await sourceFile.copy('$home/wallpaper/img.png');
 
-            // Execute main.sh inside ~/wallpaper/
-            // This is the heavy lifting (Material You generation + Shell restart)
-            debugPrint("Executing main.sh...");
-            final result = await Process.run(
-              'bash',
-              ['main.sh'],
-              workingDirectory: targetDir.path
-            );
-
-            if (result.exitCode != 0) {
-              debugPrint("Script Error: ${result.stderr}");
-            } else {
-              debugPrint("Script Output: ${result.stdout}");
-            }
+            // Run theme generation script
+            await Process.run('bash', ['main.sh'], workingDirectory: targetDir.path);
           }
         }
       }
     } catch (e) {
-      debugPrint("Wallpaper/Theme Error: $e");
+      debugPrint("Theme Error: $e");
     } finally {
-      // Small artificial delay if script was too fast, just to smooth animation
-      // or ensure UI has time to render the loading state at least briefly
       if (mounted) {
         setState(() {
           _isLoading = false;
@@ -180,14 +233,49 @@ class _MainShellState extends State<MainShell> {
     }
   }
 
+  /// Handles the specific Exit/Launch logic you requested
+  Future<void> _handleFinalLaunch() async {
+    debugPrint("Final Launch Sequence. Mode: $_currentMode");
+
+    try {
+      if (_currentMode == SystemMode.liveIso) {
+        // ==========================================
+        // SCENARIO 1: LIVE ISO
+        // ==========================================
+        // Run Calamares in detached mode
+        debugPrint("Running: calamares -d");
+        await Process.start('calamares', ['-d'], mode: ProcessStartMode.detached);
+      }
+      else if (_currentMode == SystemMode.installed) {
+        // ==========================================
+        // SCENARIO 2: INSTALLED SYSTEM
+        // ==========================================
+        // 1. Mark as Done (So app never runs again)
+        await markSetupAsComplete();
+
+        // 2. Run bal-helper
+        debugPrint("Running: bal-helper");
+        await Process.start('bal-helper', [], mode: ProcessStartMode.detached);
+      }
+    } catch (e) {
+      debugPrint("Error launching external process: $e");
+    } finally {
+      // Close the Welcome App
+      exit(0);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
-    // Logic to determine which widget to show
     Widget currentChild;
     if (_isLoading) {
-      currentChild = LoadingView(key: const ValueKey('Loading'));
+      currentChild = const LoadingView(key: ValueKey('Loading'));
     } else if (_showInfoScreen) {
-      currentChild = InfoView(key: const ValueKey('Info'), onExit: () => exit(0));
+      currentChild = InfoView(
+        key: const ValueKey('Info'),
+        mode: _currentMode,
+        onExit: _handleFinalLaunch
+      );
     } else {
       currentChild = WelcomeView(key: const ValueKey('Welcome'), onNext: _processThemeAndWallpaper);
     }
@@ -195,11 +283,9 @@ class _MainShellState extends State<MainShell> {
     return Scaffold(
       body: Stack(
         children: [
-          // Background Video
           SizedBox.expand(
             child: Video(controller: _controller, fit: BoxFit.cover, controls: NoVideoControls),
           ),
-          // Frosted Glass Overlay Effect
           Container(
             decoration: BoxDecoration(
               gradient: LinearGradient(
@@ -214,14 +300,11 @@ class _MainShellState extends State<MainShell> {
               ),
             ),
           ),
-          // Content Switcher
           AnimatedSwitcher(
             duration: const Duration(milliseconds: 800),
             switchInCurve: Curves.easeInOutQuart,
               switchOutCurve: Curves.easeInOutQuart,
                 transitionBuilder: (Widget child, Animation<double> animation) {
-                  // Different transition for Loading screen vs others could be done here
-                  // For now, a slide-fade transition works well for all
                   final offsetAnimation = Tween<Offset>(
                     begin: const Offset(0.2, 0.0),
                     end: Offset.zero,
@@ -241,7 +324,6 @@ class _MainShellState extends State<MainShell> {
 // ==========================================
 class LoadingView extends StatelessWidget {
   const LoadingView({super.key});
-
   @override
   Widget build(BuildContext context) {
     return SizedBox.expand(
@@ -252,59 +334,20 @@ class LoadingView extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             FadeInDown(
-              child: SizedBox(
-                height: 60,
-                width: 60,
-                child: const CircularProgressIndicator(
-                  color: AppTheme.primaryBlue,
-                  strokeWidth: 5,
-                ),
+              child: const SizedBox(
+                height: 60, width: 60,
+                child: CircularProgressIndicator(color: AppTheme.primaryBlue, strokeWidth: 5),
               ),
             ),
             const SizedBox(height: 30),
             FadeInUp(
               delay: const Duration(milliseconds: 200),
-              child: Text(
-                "CONNECTING...",
-                style: GoogleFonts.rubik(
-                  fontSize: 40,
-                  fontWeight: FontWeight.bold,
-                  color: AppTheme.darkText,
-                  letterSpacing: 2
-                )
-              ),
+              child: Text("CONNECTING...", style: GoogleFonts.rubik(fontSize: 40, fontWeight: FontWeight.bold, color: AppTheme.darkText, letterSpacing: 2)),
             ),
             const SizedBox(height: 10),
             FadeInUp(
               delay: const Duration(milliseconds: 400),
-              child: Text(
-                "Analyzing visual data & synchronizing theme protocols.",
-                style: GoogleFonts.sourceCodePro(
-                  fontSize: 16,
-                  color: Colors.grey[700],
-                  fontWeight: FontWeight.w500
-                )
-              ),
-            ),
-            const SizedBox(height: 10),
-            FadeInUp(
-              delay: const Duration(milliseconds: 600),
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-                decoration: BoxDecoration(
-                  color: AppTheme.primaryBlue.withOpacity(0.1),
-                  borderRadius: BorderRadius.circular(4),
-                  border: Border.all(color: AppTheme.primaryBlue.withOpacity(0.3))
-                ),
-                child: Text(
-                  "PLEASE WAIT ~ 3 SECONDS",
-                  style: GoogleFonts.rubik(
-                    fontSize: 12,
-                    color: AppTheme.primaryBlue,
-                    fontWeight: FontWeight.bold
-                  ),
-                ),
-              ),
+              child: Text("Analyzing visual data & synchronizing theme protocols.", style: GoogleFonts.sourceCodePro(fontSize: 16, color: Colors.grey[700], fontWeight: FontWeight.w500)),
             ),
           ],
         ),
@@ -332,7 +375,7 @@ class _WelcomeViewState extends State<WelcomeView> {
   void initState() {
     super.initState();
     _timer = Timer.periodic(const Duration(milliseconds: 2500), (_) {
-      setState(() { _index = (_index + 1) % _greetings.length; });
+      setState(() => _index = (_index + 1) % _greetings.length);
     });
   }
 
@@ -349,59 +392,28 @@ class _WelcomeViewState extends State<WelcomeView> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             SizedBox(
-              width: 60,
-              height: 6,
-              child: FadeInLeft(
-                from: 50,
-                duration: const Duration(milliseconds: 800),
-                child: Container(color: AppTheme.primaryBlue)
-              ),
+              width: 60, height: 6,
+              child: FadeInLeft(from: 50, duration: const Duration(milliseconds: 800), child: Container(color: AppTheme.primaryBlue)),
             ),
             const SizedBox(height: 30),
             SizedBox(
               height: 120,
               child: AnimatedSwitcher(
                 duration: const Duration(milliseconds: 600),
-                layoutBuilder: (Widget? currentChild, List<Widget> previousChildren) {
-                  return Stack(
-                    alignment: Alignment.centerLeft,
-                    children: <Widget>[
-                      ...previousChildren,
-                      if (currentChild != null) currentChild,
-                    ],
-                  );
-                },
                 transitionBuilder: (Widget child, Animation<double> animation) {
-                  return FadeTransition(
-                    opacity: animation,
-                    child: SlideTransition(
-                      position: Tween<Offset>(
-                        begin: const Offset(0.0, 0.1),
-                        end: Offset.zero
-                      ).animate(animation),
-                      child: child
-                    )
-                  );
+                  return FadeTransition(opacity: animation, child: SlideTransition(position: Tween<Offset>(begin: const Offset(0.0, 0.1), end: Offset.zero).animate(animation), child: child));
                 },
                 child: Text(
                   _greetings[_index],
                   key: ValueKey<int>(_index),
-                  style: GoogleFonts.montserrat(
-                    fontSize: 90,
-                    fontWeight: FontWeight.w200,
-                    color: AppTheme.darkText,
-                    height: 1.0,
-                    letterSpacing: -2
-                  )
+                  style: GoogleFonts.montserrat(fontSize: 90, fontWeight: FontWeight.w200, color: AppTheme.darkText, height: 1.0, letterSpacing: -2)
                 ),
               ),
             ),
             const SizedBox(height: 10),
             FadeInUp(
               delay: const Duration(milliseconds: 500),
-              child: Text("Welcome to Blue Archive Linux",
-                          style: GoogleFonts.rubik(fontSize: 28, color: AppTheme.primaryBlue, fontWeight: FontWeight.w700, letterSpacing: 1.5)
-              )
+              child: Text("Welcome to Blue Archive Linux", style: GoogleFonts.rubik(fontSize: 28, color: AppTheme.primaryBlue, fontWeight: FontWeight.w700, letterSpacing: 1.5))
             ),
             const SizedBox(height: 60),
             FadeInUp(
@@ -416,13 +428,31 @@ class _WelcomeViewState extends State<WelcomeView> {
 }
 
 // ==========================================
-// INFO VIEW
+// INFO VIEW (Dynamic based on Environment)
 // ==========================================
 class InfoView extends StatelessWidget {
   final VoidCallback onExit;
-  const InfoView({super.key, required this.onExit});
+  final SystemMode mode;
+
+  const InfoView({super.key, required this.onExit, required this.mode});
+
   @override
   Widget build(BuildContext context) {
+    // Dynamic Text Logic
+    String title = "System Initialization Complete";
+    String subtitle = "Theme synchronized. Thanks for using Blue Archive Linux.";
+    String buttonText = "LAUNCH PLASMA";
+    Color buttonColor = AppTheme.primaryBlue;
+
+    if (mode == SystemMode.liveIso) {
+      subtitle = "Live Environment Detected. You can now install the system.";
+      buttonText = "INSTALL SYSTEM"; // Will run calamares
+      buttonColor = AppTheme.successGreen;
+    } else if (mode == SystemMode.installed) {
+      subtitle = "Setup complete. Launching user session helper.";
+      buttonText = "FINISH SETUP"; // Will run bal-helper
+    }
+
     return SizedBox.expand(
       child: SingleChildScrollView(
         child: Padding(
@@ -431,11 +461,11 @@ class InfoView extends StatelessWidget {
             mainAxisAlignment: MainAxisAlignment.center,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              ZoomIn(duration: const Duration(milliseconds: 500), child: const Icon(Icons.verified_user_outlined, size: 60, color: AppTheme.primaryBlue)),
+              ZoomIn(duration: const Duration(milliseconds: 500), child: Icon(Icons.verified_user_outlined, size: 60, color: mode == SystemMode.liveIso ? AppTheme.successGreen : AppTheme.primaryBlue)),
               const SizedBox(height: 20),
-              FadeInDown(from: 20, child: Text("System Initialization Complete", style: GoogleFonts.rubik(fontSize: 40, fontWeight: FontWeight.bold, color: AppTheme.darkText, height: 1.1))),
+              FadeInDown(from: 20, child: Text(title, style: GoogleFonts.rubik(fontSize: 40, fontWeight: FontWeight.bold, color: AppTheme.darkText, height: 1.1))),
               const SizedBox(height: 10),
-              FadeInDown(delay: const Duration(milliseconds: 200), from: 20, child: Text("Theme synchronized. Thanks for using Blue Archive Linux.", style: GoogleFonts.rubik(fontSize: 22, color: Colors.grey[700], fontWeight: FontWeight.w300))),
+              FadeInDown(delay: const Duration(milliseconds: 200), from: 20, child: Text(subtitle, style: GoogleFonts.rubik(fontSize: 22, color: Colors.grey[700], fontWeight: FontWeight.w300))),
               const SizedBox(height: 50),
               FadeInRight(
                 delay: const Duration(milliseconds: 400),
@@ -446,9 +476,9 @@ class InfoView extends StatelessWidget {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Row(children: [const Icon(Icons.error_outline, color: AppTheme.warningRed), const SizedBox(width: 10), Text("EOL PROTOCOL NOTICE", style: GoogleFonts.rubik(fontWeight: FontWeight.bold, color: AppTheme.warningRed, letterSpacing: 1))]),
+                      Row(children: [const Icon(Icons.error_outline, color: AppTheme.warningRed), const SizedBox(width: 10), Text("SYSTEM NOTICE", style: GoogleFonts.rubik(fontWeight: FontWeight.bold, color: AppTheme.warningRed, letterSpacing: 1))]),
                       const SizedBox(height: 10),
-                      Text("The old Debian-based BAL is outdated. No further updates will be issued. Support is now exclusive to this Arch-based architecture.", style: GoogleFonts.rubik(color: Colors.black87, height: 1.5, fontSize: 14)),
+                      Text("The old Debian-based BAL is outdated. Support is now exclusive to this Arch-based architecture.", style: GoogleFonts.rubik(color: Colors.black87, height: 1.5, fontSize: 14)),
                     ],
                   ),
                 ),
@@ -456,7 +486,15 @@ class InfoView extends StatelessWidget {
               const SizedBox(height: 40),
               FadeInUp(delay: const Duration(milliseconds: 600), child: Text("Architect: minhmc2007", style: GoogleFonts.sourceCodePro(color: AppTheme.primaryBlue, fontSize: 16))),
               const SizedBox(height: 50),
-              FadeInUp(delay: const Duration(milliseconds: 800), child: SenseiButton(text: "LAUNCH PLASMA", onPressed: onExit, isPrimary: true)),
+              FadeInUp(
+                delay: const Duration(milliseconds: 800),
+                child: SenseiButton(
+                  text: buttonText,
+                  onPressed: onExit,
+                  isPrimary: true,
+                  customColor: mode == SystemMode.liveIso ? AppTheme.successGreen : null,
+                )
+              ),
             ],
           ),
         ),
@@ -472,7 +510,10 @@ class SenseiButton extends StatefulWidget {
   final String text;
   final VoidCallback onPressed;
   final bool isPrimary;
-  const SenseiButton({super.key, required this.text, required this.onPressed, this.isPrimary = false});
+  final Color? customColor;
+
+  const SenseiButton({super.key, required this.text, required this.onPressed, this.isPrimary = false, this.customColor});
+
   @override State<SenseiButton> createState() => _SenseiButtonState();
 }
 
@@ -480,12 +521,16 @@ class _SenseiButtonState extends State<SenseiButton> with SingleTickerProviderSt
   late AnimationController _controller;
   late Animation<double> _scaleAnimation;
   bool _isHovered = false;
+
   @override void initState() {
     super.initState();
     _controller = AnimationController(vsync: this, duration: const Duration(milliseconds: 100));
     _scaleAnimation = Tween<double>(begin: 1.0, end: 0.95).animate(_controller);
   }
+
   @override Widget build(BuildContext context) {
+    final Color mainColor = widget.customColor ?? AppTheme.primaryBlue;
+
     return MouseRegion(
       cursor: SystemMouseCursors.click,
       onEnter: (_) => setState(() => _isHovered = true),
@@ -500,16 +545,16 @@ class _SenseiButtonState extends State<SenseiButton> with SingleTickerProviderSt
             duration: const Duration(milliseconds: 200),
             padding: const EdgeInsets.symmetric(horizontal: 45, vertical: 20),
             decoration: BoxDecoration(
-              color: _isHovered ? AppTheme.primaryBlue : (widget.isPrimary ? AppTheme.primaryBlue : Colors.white),
-              border: Border.all(color: AppTheme.primaryBlue, width: 2),
+              color: _isHovered ? mainColor : (widget.isPrimary ? mainColor : Colors.white),
+              border: Border.all(color: mainColor, width: 2),
               borderRadius: BorderRadius.zero,
             ),
             child: Row(
               mainAxisSize: MainAxisSize.min,
               children: [
-                Text(widget.text, style: GoogleFonts.rubik(color: _isHovered ? Colors.white : (widget.isPrimary ? Colors.white : AppTheme.primaryBlue), fontWeight: FontWeight.bold, fontSize: 16)),
+                Text(widget.text, style: GoogleFonts.rubik(color: _isHovered ? Colors.white : (widget.isPrimary ? Colors.white : mainColor), fontWeight: FontWeight.bold, fontSize: 16)),
                 const SizedBox(width: 15),
-                Icon(Icons.arrow_forward, size: 20, color: _isHovered ? Colors.white : (widget.isPrimary ? Colors.white : AppTheme.primaryBlue))
+                Icon(Icons.arrow_forward, size: 20, color: _isHovered ? Colors.white : (widget.isPrimary ? Colors.white : mainColor))
               ],
             ),
           ),
