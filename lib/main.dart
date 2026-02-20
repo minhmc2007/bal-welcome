@@ -16,7 +16,7 @@ import 'package:window_manager/window_manager.dart';
 
 enum SystemMode { liveIso, installed, unknown }
 
-/// Checks if we are in the Arch ISO Live Environment
+/// Checks if user are in the Arch ISO Live Environment
 bool _isLiveEnv() {
   return Directory('/run/archiso/bootmnt').existsSync();
 }
@@ -33,38 +33,61 @@ SystemMode getSystemMode() {
   return SystemMode.unknown;
 }
 
+File? _sessionLockFile;
+
+void _cleanupAndExit() {
+  if (_sessionLockFile != null && _sessionLockFile!.existsSync()) {
+    try {
+      _sessionLockFile!.deleteSync();
+    } catch (_) {}
+  }
+  exit(0);
+}
+
 /// 1. Checks for Session Lock (Prevent opening app twice in same session)
 /// 2. Checks for First-Run Lock (If installed, prevent running ever again)
 Future<void> performStartupChecks() async {
   final mode = getSystemMode();
   final String? home = Platform.environment['HOME'];
 
-  // A. SESSION LOCK (Prevents double-clicking icon)
-  // ------------------------------------------------
-  final sessionLock = File('/tmp/bal_welcome_session.lock');
-  if (await sessionLock.exists()) {
-    // App is already running in this session. Exit silently.
-    exit(0);
-  }
-  try {
-    await sessionLock.create();
-    // Clean up lock when app closes naturally (optional, but good practice)
-    ProcessSignal.sigterm.watch().listen((_) => sessionLock.deleteSync());
-  } catch (e) {
-    debugPrint("Warning: Could not create session lock: $e");
+  if (home == null) {
+    debugPrint("Warning: HOME environment variable is not set.");
+    return;
   }
 
-  // B. PERSISTENT LOCK (Strict "Run Once" for Installed System)
-  // ------------------------------------------------
-  // If we are installed, we only want to run this app ONE TIME ever.
-  if (mode == SystemMode.installed && home != null) {
+  // A. PERSISTENT LOCK (Strict "Run Once" for Installed System)
+  // Check this FIRST. If already done, exit immediately.
+  // Saved in $HOME/.config, so it naturally runs exactly 1 time per user.
+  if (mode == SystemMode.installed) {
     final firstRunMarker = File('$home/.config/bal-welcome-done');
 
     if (await firstRunMarker.exists()) {
-      debugPrint("System is installed and Welcome App has run before.");
-      debugPrint("Exiting to prevent re-run.");
+      debugPrint("Welcome App has already run for this user. Exiting.");
       exit(0);
     }
+  }
+
+  // B. SESSION LOCK (Prevents double-clicking icon)
+  // Placed in ~/.local so it doesn't block other users on the same system (unlike /tmp)
+  final localDir = Directory('$home/.local');
+  if (!await localDir.exists()) {
+    await localDir.create(recursive: true);
+  }
+
+  _sessionLockFile = File('$home/.local/bal_welcome_session.lock');
+  if (await _sessionLockFile!.exists()) {
+    // App is already running in this session for this user. Exit silently.
+    // Note: We use exit(0) directly here so we don't accidentally delete the main app's lock.
+    exit(0);
+  }
+
+  try {
+    await _sessionLockFile!.create();
+    // Clean up lock on termination signals (Ctrl+C, kill)
+    ProcessSignal.sigterm.watch().listen((_) => _cleanupAndExit());
+    ProcessSignal.sigint.watch().listen((_) => _cleanupAndExit());
+  } catch (e) {
+    debugPrint("Warning: Could not create session lock: $e");
   }
 }
 
@@ -162,7 +185,7 @@ class MainShell extends StatefulWidget {
   State<MainShell> createState() => _MainShellState();
 }
 
-class _MainShellState extends State<MainShell> {
+class _MainShellState extends State<MainShell> with WindowListener {
   late final Player _player;
   late final VideoController _controller;
 
@@ -173,6 +196,7 @@ class _MainShellState extends State<MainShell> {
   @override
   void initState() {
     super.initState();
+    windowManager.addListener(this);
     _currentMode = getSystemMode();
 
     _player = Player();
@@ -184,15 +208,54 @@ class _MainShellState extends State<MainShell> {
 
   @override
   void dispose() {
+    windowManager.removeListener(this);
     _player.dispose();
     super.dispose();
   }
 
-  /// Theme generation logic (Main.sh)
+  @override
+  void onWindowClose() {
+    _cleanupAndExit();
+  }
+
+  /// Helper function to show a popup dialog on error
+  Future<void> _showErrorDialog(String title, String message) async {
+    return showDialog<void>(
+      context: context,
+      barrierDismissible: false, // User must tap OK button
+      builder: (BuildContext dialogContext) {
+        return AlertDialog(
+          backgroundColor: Colors.white,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+          title: Row(
+            children: [
+              const Icon(Icons.warning_amber_rounded, color: AppTheme.warningRed, size: 28),
+              const SizedBox(width: 10),
+              Text(title, style: GoogleFonts.rubik(color: AppTheme.warningRed, fontWeight: FontWeight.bold, fontSize: 20)),
+            ],
+          ),
+          content: SingleChildScrollView(
+            child: Text(message, style: GoogleFonts.rubik(color: AppTheme.darkText, fontSize: 15)),
+          ),
+          actions: <Widget>[
+            TextButton(
+              child: Text('OK', style: GoogleFonts.rubik(color: AppTheme.primaryBlue, fontWeight: FontWeight.bold, fontSize: 16)),
+              onPressed: () {
+                Navigator.of(dialogContext).pop(); // Dismiss alert dialog
+              },
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  /// Theme generation logic (Material You Colors)
   Future<void> _processThemeAndWallpaper() async {
     setState(() => _isLoading = true);
 
     try {
+      // 1. Set Random Wallpaper from /usr/share/backgrounds
       final dir = Directory('/usr/share/backgrounds');
       if (await dir.exists()) {
         final files = dir.listSync().where((file) {
@@ -204,26 +267,41 @@ class _MainShellState extends State<MainShell> {
           final randomFile = files[Random().nextInt(files.length)];
           final String selectedPath = randomFile.path;
 
-          // Apply visually immediately (optional)
-          try { await Process.run('plasma-apply-wallpaperimage', [selectedPath]); } catch (_) {}
-
-          final String? home = Platform.environment['HOME'];
-          if (home != null) {
-            final targetDir = Directory('$home/wallpaper');
-            if (!await targetDir.exists()) await targetDir.create(recursive: true);
-
-            // Copy to ~/wallpaper/img.png
-            final File sourceFile = File(selectedPath);
-            await sourceFile.copy('$home/wallpaper/img.png');
-
-            // Run theme generation script
-            await Process.run('bash', ['main.sh'], workingDirectory: targetDir.path);
+          debugPrint("Applying random wallpaper: $selectedPath");
+          try {
+            final wpResult = await Process.run('plasma-apply-wallpaperimage', [selectedPath]);
+            if (wpResult.exitCode != 0) {
+              debugPrint("Wallpaper warning: ${wpResult.stderr}");
+            }
+          } catch (e) {
+            debugPrint("Failed to apply wallpaper: $e");
           }
+        }
+      }
+
+      // 2. Run kde-material-you-colors
+      debugPrint("Running kde-material-you-colors -a");
+      final result = await Process.run('kde-material-you-colors', ['-a']);
+
+      if (result.exitCode != 0) {
+        debugPrint("Theme Error Output: ${result.stderr}");
+        if (mounted) {
+          await _showErrorDialog(
+            "Theme Generation Error",
+            "Command 'kde-material-you-colors' returned an error.\n\nDetails:\n${result.stderr}"
+          );
         }
       }
     } catch (e) {
       debugPrint("Theme Error: $e");
+      if (mounted) {
+        await _showErrorDialog(
+          "Execution Error",
+          "Failed to execute theme protocols.\n\nDetails:\n$e"
+        );
+      }
     } finally {
+      // Regardless of error or success, proceed to the Info screen when done
       if (mounted) {
         setState(() {
           _isLoading = false;
@@ -233,35 +311,40 @@ class _MainShellState extends State<MainShell> {
     }
   }
 
-  /// Handles the specific Exit/Launch logic you requested
+  /// Handles the specific Exit/Launch logic
   Future<void> _handleFinalLaunch() async {
     debugPrint("Final Launch Sequence. Mode: $_currentMode");
 
     try {
       if (_currentMode == SystemMode.liveIso) {
         // ==========================================
-        // SCENARIO 1: LIVE ISO
+        // SCENARIO 1: LIVE ISO (chimera-gui)
         // ==========================================
-        // Run Calamares in detached mode
-        debugPrint("Running: calamares -d");
-        await Process.start('calamares', ['-d'], mode: ProcessStartMode.detached);
+        debugPrint("Running: chimera-gui");
+        await Process.start('chimera-gui', [], mode: ProcessStartMode.detached);
       }
       else if (_currentMode == SystemMode.installed) {
         // ==========================================
         // SCENARIO 2: INSTALLED SYSTEM
         // ==========================================
-        // 1. Mark as Done (So app never runs again)
         await markSetupAsComplete();
-
-        // 2. Run bal-helper
         debugPrint("Running: bal-helper");
         await Process.start('bal-helper', [], mode: ProcessStartMode.detached);
       }
+
+      // If we launched successfully, clean up the lock and exit
+      _cleanupAndExit();
+
     } catch (e) {
       debugPrint("Error launching external process: $e");
-    } finally {
-      // Close the Welcome App
-      exit(0);
+      if (mounted) {
+        await _showErrorDialog(
+          "Launch Error",
+          "Failed to start the external application.\n\nDetails:\n$e"
+        );
+      }
+      // Note: We deliberately do NOT exit(0) here if it errors out,
+      // giving the user a chance to read the popup and click the button again.
     }
   }
 
@@ -347,7 +430,7 @@ class LoadingView extends StatelessWidget {
             const SizedBox(height: 10),
             FadeInUp(
               delay: const Duration(milliseconds: 400),
-              child: Text("Analyzing visual data & synchronizing theme protocols.", style: GoogleFonts.sourceCodePro(fontSize: 16, color: Colors.grey[700], fontWeight: FontWeight.w500)),
+              child: Text("Applying Material You Colors protocol.", style: GoogleFonts.sourceCodePro(fontSize: 16, color: Colors.grey[700], fontWeight: FontWeight.w500)),
             ),
           ],
         ),
@@ -446,7 +529,7 @@ class InfoView extends StatelessWidget {
 
     if (mode == SystemMode.liveIso) {
       subtitle = "Live Environment Detected. You can now install the system.";
-      buttonText = "INSTALL SYSTEM"; // Will run calamares
+      buttonText = "INSTALL SYSTEM"; // Will run chimera-gui
       buttonColor = AppTheme.successGreen;
     } else if (mode == SystemMode.installed) {
       subtitle = "Setup complete. Launching user session helper.";

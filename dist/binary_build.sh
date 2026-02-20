@@ -3,7 +3,7 @@ set -e
 
 # === CONFIG ===
 PKG_NAME="bal-welcome-bin"
-PKG_VER="1.0.4"
+PKG_VER="1.0.5"
 PKG_REL="1"
 # ==============
 
