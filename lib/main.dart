@@ -56,8 +56,6 @@ Future<void> performStartupChecks() async {
   }
 
   // A. PERSISTENT LOCK (Strict "Run Once" for Installed System)
-  // Check this FIRST. If already done, exit immediately.
-  // Saved in $HOME/.config, so it naturally runs exactly 1 time per user.
   if (mode == SystemMode.installed) {
     final firstRunMarker = File('$home/.config/bal-welcome-done');
 
@@ -68,7 +66,6 @@ Future<void> performStartupChecks() async {
   }
 
   // B. SESSION LOCK (Prevents double-clicking icon)
-  // Placed in ~/.local so it doesn't block other users on the same system (unlike /tmp)
   final localDir = Directory('$home/.local');
   if (!await localDir.exists()) {
     await localDir.create(recursive: true);
@@ -76,14 +73,11 @@ Future<void> performStartupChecks() async {
 
   _sessionLockFile = File('$home/.local/bal_welcome_session.lock');
   if (await _sessionLockFile!.exists()) {
-    // App is already running in this session for this user. Exit silently.
-    // Note: We use exit(0) directly here so we don't accidentally delete the main app's lock.
     exit(0);
   }
 
   try {
     await _sessionLockFile!.create();
-    // Clean up lock on termination signals (Ctrl+C, kill)
     ProcessSignal.sigterm.watch().listen((_) => _cleanupAndExit());
     ProcessSignal.sigint.watch().listen((_) => _cleanupAndExit());
   } catch (e) {
@@ -100,7 +94,6 @@ Future<void> markSetupAsComplete() async {
       if (!await configDir.exists()) {
         await configDir.create(recursive: true);
       }
-      // Create the empty file acting as a flag
       await File('$home/.config/bal-welcome-done').create();
       debugPrint("Setup marked as complete. App will not open again.");
     } catch (e) {
@@ -128,7 +121,6 @@ void fixLinuxLocale() {
 }
 
 Future<void> main() async {
-  // Run checks BEFORE UI init. If check fails (already run), app exits here.
   await performStartupChecks();
   fixLinuxLocale();
 
@@ -201,6 +193,7 @@ class _MainShellState extends State<MainShell> with WindowListener {
 
     _player = Player();
     _controller = VideoController(_player);
+    // Ensure this asset exists in your pubspec.yaml
     _player.open(Media('asset:///assets/video/bg_loop.mp4'));
     _player.setPlaylistMode(PlaylistMode.loop);
     _player.setVolume(0.0);
@@ -218,11 +211,10 @@ class _MainShellState extends State<MainShell> with WindowListener {
     _cleanupAndExit();
   }
 
-  /// Helper function to show a popup dialog on error
   Future<void> _showErrorDialog(String title, String message) async {
     return showDialog<void>(
       context: context,
-      barrierDismissible: false, // User must tap OK button
+      barrierDismissible: false,
       builder: (BuildContext dialogContext) {
         return AlertDialog(
           backgroundColor: Colors.white,
@@ -241,7 +233,7 @@ class _MainShellState extends State<MainShell> with WindowListener {
             TextButton(
               child: Text('OK', style: GoogleFonts.rubik(color: AppTheme.primaryBlue, fontWeight: FontWeight.bold, fontSize: 16)),
               onPressed: () {
-                Navigator.of(dialogContext).pop(); // Dismiss alert dialog
+                Navigator.of(dialogContext).pop();
               },
             ),
           ],
@@ -250,12 +242,10 @@ class _MainShellState extends State<MainShell> with WindowListener {
     );
   }
 
-  /// Theme generation logic (Material You Colors)
   Future<void> _processThemeAndWallpaper() async {
     setState(() => _isLoading = true);
 
     try {
-      // 1. Set Random Wallpaper from /usr/share/backgrounds
       final dir = Directory('/usr/share/backgrounds');
       if (await dir.exists()) {
         final files = dir.listSync().where((file) {
@@ -266,25 +256,15 @@ class _MainShellState extends State<MainShell> with WindowListener {
         if (files.isNotEmpty) {
           final randomFile = files[Random().nextInt(files.length)];
           final String selectedPath = randomFile.path;
-
-          debugPrint("Applying random wallpaper: $selectedPath");
           try {
-            final wpResult = await Process.run('plasma-apply-wallpaperimage', [selectedPath]);
-            if (wpResult.exitCode != 0) {
-              debugPrint("Wallpaper warning: ${wpResult.stderr}");
-            }
-          } catch (e) {
-            debugPrint("Failed to apply wallpaper: $e");
-          }
+            await Process.run('plasma-apply-wallpaperimage', [selectedPath]);
+          } catch (_) {}
         }
       }
 
-      // 2. Run kde-material-you-colors
-      debugPrint("Running kde-material-you-colors -a");
       final result = await Process.run('kde-material-you-colors', ['-a']);
 
       if (result.exitCode != 0) {
-        debugPrint("Theme Error Output: ${result.stderr}");
         if (mounted) {
           await _showErrorDialog(
             "Theme Generation Error",
@@ -293,7 +273,6 @@ class _MainShellState extends State<MainShell> with WindowListener {
         }
       }
     } catch (e) {
-      debugPrint("Theme Error: $e");
       if (mounted) {
         await _showErrorDialog(
           "Execution Error",
@@ -301,7 +280,6 @@ class _MainShellState extends State<MainShell> with WindowListener {
         );
       }
     } finally {
-      // Regardless of error or success, proceed to the Info screen when done
       if (mounted) {
         setState(() {
           _isLoading = false;
@@ -311,40 +289,22 @@ class _MainShellState extends State<MainShell> with WindowListener {
     }
   }
 
-  /// Handles the specific Exit/Launch logic
   Future<void> _handleFinalLaunch() async {
-    debugPrint("Final Launch Sequence. Mode: $_currentMode");
-
     try {
       if (_currentMode == SystemMode.liveIso) {
-        // ==========================================
-        // SCENARIO 1: LIVE ISO (chimera-gui)
-        // ==========================================
-        debugPrint("Running: chimera-gui");
         await Process.start('chimera-gui', [], mode: ProcessStartMode.detached);
-      }
-      else if (_currentMode == SystemMode.installed) {
-        // ==========================================
-        // SCENARIO 2: INSTALLED SYSTEM
-        // ==========================================
+      } else if (_currentMode == SystemMode.installed) {
         await markSetupAsComplete();
-        debugPrint("Running: bal-helper");
         await Process.start('bal-helper', [], mode: ProcessStartMode.detached);
       }
-
-      // If we launched successfully, clean up the lock and exit
       _cleanupAndExit();
-
     } catch (e) {
-      debugPrint("Error launching external process: $e");
       if (mounted) {
         await _showErrorDialog(
           "Launch Error",
           "Failed to start the external application.\n\nDetails:\n$e"
         );
       }
-      // Note: We deliberately do NOT exit(0) here if it errors out,
-      // giving the user a chance to read the popup and click the button again.
     }
   }
 
@@ -440,7 +400,7 @@ class LoadingView extends StatelessWidget {
 }
 
 // ==========================================
-// WELCOME VIEW
+// WELCOME VIEW (FIXED ALIGNMENT)
 // ==========================================
 class WelcomeView extends StatefulWidget {
   final VoidCallback onNext;
@@ -479,17 +439,45 @@ class _WelcomeViewState extends State<WelcomeView> {
               child: FadeInLeft(from: 50, duration: const Duration(milliseconds: 800), child: Container(color: AppTheme.primaryBlue)),
             ),
             const SizedBox(height: 30),
+            // FIXED: Added width: double.infinity and custom layoutBuilder for left alignment
             SizedBox(
               height: 120,
+              width: double.infinity,
               child: AnimatedSwitcher(
                 duration: const Duration(milliseconds: 600),
+                // This forces the children in the stack to align to the left
+                layoutBuilder: (Widget? currentChild, List<Widget> previousChildren) {
+                  return Stack(
+                    alignment: Alignment.centerLeft,
+                    children: <Widget>[
+                      ...previousChildren,
+                      if (currentChild != null) currentChild,
+                    ],
+                  );
+                },
                 transitionBuilder: (Widget child, Animation<double> animation) {
-                  return FadeTransition(opacity: animation, child: SlideTransition(position: Tween<Offset>(begin: const Offset(0.0, 0.1), end: Offset.zero).animate(animation), child: child));
+                  return FadeTransition(
+                    opacity: animation,
+                    child: SlideTransition(
+                      position: Tween<Offset>(
+                        begin: const Offset(0.0, 0.1),
+                        end: Offset.zero
+                      ).animate(animation),
+                      child: child
+                    )
+                  );
                 },
                 child: Text(
                   _greetings[_index],
                   key: ValueKey<int>(_index),
-                  style: GoogleFonts.montserrat(fontSize: 90, fontWeight: FontWeight.w200, color: AppTheme.darkText, height: 1.0, letterSpacing: -2)
+                  textAlign: TextAlign.left,
+                  style: GoogleFonts.montserrat(
+                    fontSize: 90,
+                    fontWeight: FontWeight.w200,
+                    color: AppTheme.darkText,
+                    height: 1.0,
+                    letterSpacing: -2
+                  )
                 ),
               ),
             ),
@@ -511,7 +499,7 @@ class _WelcomeViewState extends State<WelcomeView> {
 }
 
 // ==========================================
-// INFO VIEW (Dynamic based on Environment)
+// INFO VIEW
 // ==========================================
 class InfoView extends StatelessWidget {
   final VoidCallback onExit;
@@ -521,7 +509,6 @@ class InfoView extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    // Dynamic Text Logic
     String title = "System Initialization Complete";
     String subtitle = "Theme synchronized. Thanks for using Blue Archive Linux.";
     String buttonText = "LAUNCH PLASMA";
@@ -529,11 +516,11 @@ class InfoView extends StatelessWidget {
 
     if (mode == SystemMode.liveIso) {
       subtitle = "Live Environment Detected. You can now install the system.";
-      buttonText = "INSTALL SYSTEM"; // Will run chimera-gui
+      buttonText = "INSTALL SYSTEM";
       buttonColor = AppTheme.successGreen;
     } else if (mode == SystemMode.installed) {
       subtitle = "Setup complete. Launching user session helper.";
-      buttonText = "FINISH SETUP"; // Will run bal-helper
+      buttonText = "FINISH SETUP";
     }
 
     return SizedBox.expand(
